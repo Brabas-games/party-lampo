@@ -6,7 +6,7 @@
 <meta name="theme-color" content="#1a0f3d">
 <title>Party Lampo</title>
 <meta name="description" content="Party Lampo: minigiochi online da giocare con gli amici, dal telefono o dal PC.">
-<script src="https://unpkg.com/peerjs@1.5.5/dist/peerjs.min.js"></script>
+<script src="https://unpkg.com/mqtt@5/dist/mqtt.min.js"></script>
 <link rel="preconnect" href="https://fonts.googleapis.com">
 <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
 <link href="https://fonts.googleapis.com/css2?family=Fredoka:wght@500;600;700&family=Lilita+One&display=swap" rel="stylesheet">
@@ -260,19 +260,20 @@ let lastF = now();
 let toastT;
 function toast(msg) { const t = $('toast'); t.textContent = msg; t.style.opacity = 1; clearTimeout(toastT); toastT = setTimeout(() => t.style.opacity = 0, 2600); }
 
-// ---------- rete (PeerJS: il creatore della stanza fa da "server", gli altri si collegano a lui) ----------
-const PeerCls = window.Peer || (window.peerjs && window.peerjs.Peer);
-const ROOM = typeof PeerCls === 'function';
+// ---------- rete (MQTT: i messaggi passano da un server pubblico, così funziona da qualunque rete) ----------
+const ROOM = !!(window.mqtt && typeof window.mqtt.connect === 'function');
 const roomReady = true;
-const PREFIX = 'partylampo-v1-';
-// configurazione di rete predefinita di PeerJS: include i server "ponte" (TURN) necessari con i dati mobili
-const PEER_OPTS = { debug: 0 };
-const APP_VERSION = 'v3';
+const APP_VERSION = 'v4';
+const BROKERS = ['wss://broker.emqx.io:8084/mqtt', 'wss://broker.hivemq.com:8884/mqtt', 'wss://test.mosquitto.org:8081/mqtt'];
+const TOPIC = code => 'partylampo/v1/' + code.toLowerCase();
 const sleep = ms => new Promise(r => setTimeout(r, ms));
+const rid = () => (Math.random().toString(36).slice(2, 8) + Math.random().toString(36).slice(2, 8)).replace(/[^a-z0-9]/g, 'x');
 const okPresence = pr => { if (!pr || typeof pr !== 'object' || Array.isArray(pr)) return false; try { return JSON.stringify(pr).length < 6000; } catch (e) { return false; } };
+const dec = new TextDecoder();
+const parseMsg = b => { try { const t = typeof b === 'string' ? b : dec.decode(b); return t.length > 30000 ? null : JSON.parse(t); } catch (e) { return null; } };
 
 const Net = {
-  solo: false, peer: null, oldPeers: [], host: false, hostConn: null, conns: new Map(), pres: new Map(), snap: [], mine: {}, myId: null, sendT: null, bcT: null,
+  solo: false, cli: null, host: false, base: '', pres: new Map(), seen: new Map(), snap: [], mine: {}, myId: null, sendT: null, bcT: null, lastDown: 0, warned: false,
   list() {
     if (this.solo) return [{ peer: 'me', sameTab: true, presence: this.mine }];
     if (!this.myId) return [];
@@ -283,41 +284,58 @@ const Net = {
   },
   set(p) {
     for (const k in p) { if (p[k] === null) delete this.mine[k]; else this.mine[k] = p[k]; }
-    if (this.host) this.schedBc(); else if (this.hostConn) this.schedSend();
+    if (this.host) this.schedBc(); else if (this.cli) this.schedSend();
     onNet();
   },
+  pub(topic, obj) { try { if (this.cli && this.cli.connected) this.cli.publish(topic, JSON.stringify(obj), { qos: 0 }); } catch (e) {} },
   schedSend() {
     if (this.sendT) return;
-    this.sendT = setTimeout(() => { this.sendT = null; try { if (this.hostConn && this.hostConn.open) this.hostConn.send({ t: 'p', pr: this.mine }); } catch (e) {} }, 40);
+    this.sendT = setTimeout(() => { this.sendT = null; this.pub(this.base + '/up/' + this.myId, { pr: this.mine }); }, 80);
   },
   schedBc() {
     if (this.bcT) return;
-    this.bcT = setTimeout(() => {
-      this.bcT = null;
-      const msg = { t: 's', peers: this.list().map(e => ({ peer: e.peer, presence: e.presence })) };
-      this.conns.forEach(c => { try { if (c.open) c.send(msg); } catch (e) {} });
-    }, 50);
+    this.bcT = setTimeout(() => { this.bcT = null; this.pub(this.base + '/down', { peers: this.list().map(e => ({ peer: e.peer, presence: e.presence })) }); }, 100);
   },
   myPeer() { return this.solo ? 'me' : this.myId; },
   async leave() {
-    const p = this.peer;
-    this.oldPeers.forEach(o => { try { o.destroy(); } catch (e) {} }); this.oldPeers = [];
-    this.peer = null; this.host = false; this.hostConn = null; this.conns = new Map(); this.pres = new Map(); this.snap = [];
-    this.solo = false; this.mine = {}; this.myId = null;
-    if (p) { try { p.destroy(); } catch (e) {} }
+    const c = this.cli;
+    if (c) {
+      if (this.host) this.pub(this.base + '/down', { closed: 1 }); else if (this.myId) this.pub(this.base + '/up/' + this.myId, { bye: 1 });
+      await sleep(200); try { c.end(true); } catch (e) {}
+    }
+    this.cli = null; this.host = false; this.base = ''; this.pres = new Map(); this.seen = new Map(); this.snap = [];
+    this.solo = false; this.mine = {}; this.myId = null; this.lastDown = 0; this.warned = false;
   },
 };
-function makePeer(id) {
+function connectBroker(url, extra) {
   return new Promise((res, rej) => {
-    let p;
-    try { p = id ? new PeerCls(id, PEER_OPTS) : new PeerCls(PEER_OPTS); } catch (e) { rej(e); return; }
-    const to = setTimeout(() => { try { p.destroy(); } catch (e) {} rej({ type: 'timeout' }); }, 12000);
-    p.on('open', () => { clearTimeout(to); res(p); });
-    p.on('error', e => { clearTimeout(to); rej(e); });
+    let c;
+    try { c = mqtt.connect(url, Object.assign({ clientId: 'pl_' + rid(), clean: true, connectTimeout: 7000, reconnectPeriod: 1500, keepalive: 20 }, extra || {})); }
+    catch (e) { rej({ type: 'mqtt' }); return; }
+    const to = setTimeout(() => { try { c.end(true); } catch (e) {} rej({ type: 'timeout' }); }, 8000);
+    c.once('connect', () => { clearTimeout(to); res(c); });
+    c.on('error', () => {});
   });
 }
-// ripete lo stato ogni 2 secondi: se un messaggio si perde, si recupera subito
-setInterval(() => { if (Net.solo) return; if (Net.host) Net.schedBc(); else if (Net.hostConn) Net.schedSend(); }, 2000);
+// ripete lo stato ogni 2 secondi e controlla chi è ancora collegato
+setInterval(() => {
+  if (Net.solo || !Net.cli) return;
+  if (Net.host) {
+    const t = Date.now();
+    Net.seen.forEach((v, id) => { if (t - v > 20000) { Net.seen.delete(id); Net.pres.delete(id); onNet(); } });
+    Net.schedBc();
+  } else {
+    Net.schedSend();
+    const quiet = Date.now() - Net.lastDown;
+    if (quiet > 9000 && !Net.warned) { Net.warned = true; toast('Il capo stanza non risponde… aspetto che torni sul gioco'); }
+    if (quiet > 60000) hostGone();
+  }
+}, 2000);
+document.addEventListener('visibilitychange', () => {
+  if (document.hidden) return;
+  try { if (Net.cli && !Net.cli.connected) Net.cli.reconnect(); } catch (e) {}
+  keepAwake();
+});
 addEventListener('hashchange', () => { const h = (location.hash || '').replace('#', '').toUpperCase(); if (/^[A-Z]{4}$/.test(h)) $('jcode').value = h; });
 function hostGone() {
   if (ST.screen !== 'room' || Net.host) return;
@@ -626,7 +644,7 @@ function renderLobby(g) {
     st.classList.remove('hidden');
     const ok = hostOnline();
     st.className = 'net ' + (ok ? 'ok' : 'ko');
-    st.innerHTML = ok ? '🟢 Stanza aperta: i tuoi amici possono entrare' : '<span class="dots">🟠 Riapro la stanza</span>';
+    st.innerHTML = ok ? '🟢 Stanza aperta: i tuoi amici possono entrare' : '<span class="dots">🟠 Mi ricollego al server</span>';
   }
   $('linv').textContent = Net.solo ? 'Modalità allenamento: gioca da solo per fare pratica con i minigiochi.' :
     'Manda l\'invito ai tuoi amici e poi torna subito qui: la stanza resta aperta solo mentre questa pagina è aperta sul tuo schermo.';
@@ -700,66 +718,7 @@ function setBusy(b, label) {
   busy = b; $('create').disabled = b || !ROOM; $('join').disabled = b || !ROOM;
   if (b) { $('hmsg').innerHTML = `<span class="dots">${label}</span>`; delete $('hmsg').dataset.err; } else if (!$('hmsg').dataset.err) $('hmsg').textContent = '';
 }
-// --- host: tiene la stanza "visibile" sul server anche se il telefono mette in pausa la pagina ---
-function attachHost(peer) {
-  peer.on('connection', conn => {
-    if (Net.peer !== peer) { conn.on('open', () => { try { conn.close(); } catch (e) {} }); return; }
-    const drop = () => { if (Net.conns.get(conn.peer) !== conn) return; Net.conns.delete(conn.peer); Net.pres.delete(conn.peer); Net.schedBc(); onNet(); };
-    conn.on('open', () => {
-      if (Net.conns.size >= 11 && !Net.conns.has(conn.peer)) { try { conn.close(); } catch (e) {} return; }
-      const old = Net.conns.get(conn.peer); Net.conns.set(conn.peer, conn); if (old && old !== conn) { try { old.close(); } catch (e) {} }
-      Net.schedBc();
-    });
-    conn.on('data', d => { if (d && d.t === 'p' && okPresence(d.pr)) { Net.pres.set(conn.peer, d.pr); Net.schedBc(); onNet(); } });
-    conn.on('close', drop); conn.on('error', drop);
-  });
-  peer.on('disconnected', () => { if (Net.peer === peer) setTimeout(hostKeepAlive, 500); });
-  peer.on('error', e => { if (Net.peer === peer && e && /unavailable-id|network|server-error|socket-error|socket-closed/.test(e.type || '')) setTimeout(hostKeepAlive, 2000); });
-}
-let fixing = false;
-function waitOpen(p, ms) {
-  return new Promise(res => {
-    let done = false;
-    const f = ok => { if (done) return; done = true; clearTimeout(t); try { p.off('open', o); p.off('error', er); } catch (e) {} res(ok); };
-    const o = () => f(true), er = () => f(false);
-    const t = setTimeout(() => f(!p.disconnected && !p.destroyed), ms);
-    p.on('open', o); p.on('error', er);
-  });
-}
-// force = true: ri-registra comunque la stanza sul server (Safari su iPhone chiude il collegamento senza avvisare)
-async function hostKeepAlive(force) {
-  if (!Net.host || !Net.peer || fixing) return;
-  const p = Net.peer;
-  const broken = p.disconnected || p.destroyed || p.open === false;
-  if (!broken && force !== true) return;
-  fixing = true; onNet();
-  try {
-    let ok = false;
-    if (!p.destroyed) {
-      try { if (!p.disconnected) p.disconnect(); } catch (e) {}
-      await sleep(300);
-      try { p.reconnect(); } catch (e) {}
-      ok = await waitOpen(p, 5000);
-    }
-    for (let i = 0; !ok && i < 10 && Net.host && Net.peer === p; i++) {
-      try {
-        const np = await makePeer(PREFIX + ST.code.toLowerCase());
-        if (!Net.host) { np.destroy(); break; }
-        Net.oldPeers.push(p); Net.peer = np; attachHost(np); ok = true;
-        try { p.disconnect(); } catch (e) {}
-      } catch (e) { await sleep(2500); }
-    }
-  } finally { fixing = false; onNet(); }
-}
-const hostOnline = () => Net.host && Net.peer && !Net.peer.disconnected && !Net.peer.destroyed && !fixing;
-setInterval(hostKeepAlive, 3000);
-let hiddenAt = 0;
-document.addEventListener('visibilitychange', () => {
-  if (document.hidden) { hiddenAt = Date.now(); return; }
-  if (hiddenAt && Date.now() - hiddenAt > 800) hostKeepAlive(true); else hostKeepAlive();
-  hiddenAt = 0; keepAwake();
-});
-addEventListener('pageshow', e => { if (e.persisted) hostKeepAlive(true); });
+const hostOnline = () => Net.host && Net.cli && Net.cli.connected;
 let wakeLock = null;
 async function keepAwake() {
   try { if (ST.screen === 'room' && !Net.solo && navigator.wakeLock && !document.hidden && (!wakeLock || wakeLock.released)) wakeLock = await navigator.wakeLock.request('screen'); } catch (e) {}
@@ -769,15 +728,29 @@ $('create').onclick = async () => {
   ensureAudio(); if (!ROOM || busy) return; setBusy(true, 'Creo la stanza');
   const me = myInfo();
   try {
-    let peer = null, code = '';
-    for (let i = 0; i < 5 && !peer; i++) {
-      code = genCode();
-      try { peer = await makePeer(PREFIX + code.toLowerCase()); }
-      catch (e) { if (!e || e.type !== 'unavailable-id') throw e; }
-    }
-    if (!peer) throw new Error('nessun codice');
-    Net.peer = peer; Net.host = true; Net.myId = peer.id;
-    attachHost(peer);
+    let cli = null, lastErr = null;
+    for (const url of BROKERS) { try { cli = await connectBroker(url); break; } catch (e) { lastErr = e; } }
+    if (!cli) throw lastErr || { type: 'timeout' };
+    const code = genCode();
+    Net.cli = cli; Net.host = true; Net.myId = rid(); Net.base = TOPIC(code);
+    const up = Net.base + '/up/';
+    const sub = () => cli.subscribe(up + '+', { qos: 0 });
+    sub();
+    cli.on('connect', () => { if (Net.cli === cli) { sub(); Net.schedBc(); onNet(); } });
+    cli.on('offline', onNet); cli.on('close', onNet);
+    cli.on('message', (topic, payload) => {
+      if (Net.cli !== cli || !topic.startsWith(up)) return;
+      const id = topic.slice(up.length);
+      if (!/^[a-z0-9]{6,24}$/.test(id) || id === Net.myId) return;
+      const d = parseMsg(payload); if (!d) return;
+      if (d.hello) { Net.schedBc(); return; }
+      if (d.bye) { Net.pres.delete(id); Net.seen.delete(id); }
+      else if (okPresence(d.pr)) {
+        if (!Net.pres.has(id) && Net.pres.size >= 11) return;
+        Net.pres.set(id, d.pr); Net.seen.set(id, Date.now());
+      } else return;
+      Net.schedBc(); onNet();
+    });
     roomState(code);
     H.on = true; H.g = lobbyG(5); H.t = now();
     Net.set({ n: me.n, e: me.e, h: true, g: clone(H.g) });
@@ -785,18 +758,7 @@ $('create').onclick = async () => {
   } catch (e) { await Net.leave(); setBusy(false); homeErr(`Non riesco a creare la stanza: controlla la connessione e riprova. [${APP_VERSION} · ${(e && e.type) || 'sconosciuto'}]`); }
 };
 
-// --- chi entra: se la stanza non risponde subito, riprova per ~30 secondi ---
-function tryConnect(peer, target) {
-  return new Promise((res, rej) => {
-    const conn = peer.connect(target, { reliable: true });
-    let done = false;
-    const fin = (ok, v) => { if (done) return; done = true; clearTimeout(to); peer.off('error', onErr); ok ? res(conn) : (rej(v), (() => { try { conn.close(); } catch (e) {} })()); };
-    const onErr = e => fin(false, e);
-    const to = setTimeout(() => fin(false, { type: 'timeout' }), 10000);
-    conn.on('open', () => fin(true));
-    peer.on('error', onErr);
-  });
-}
+// chi entra: si collega a tutti i server insieme e usa quello dove risponde la stanza
 let joinAbort = false;
 $('join').onclick = async () => {
   ensureAudio(); if (!ROOM || busy) return;
@@ -804,39 +766,51 @@ $('join').onclick = async () => {
   if (code.length !== 4) { homeErr('Il codice ha 4 lettere 😉'); return; }
   setBusy(true, 'Entro nella stanza ' + code); const me = myInfo();
   joinAbort = false;
-  let lastErr = null;
+  const myId = rid(), base = TOPIC(code), down = base + '/down';
+  const will = { topic: base + '/up/' + myId, payload: JSON.stringify({ bye: 1 }), qos: 0, retain: false };
+  const clients = []; let winner = null, anyConnected = false;
   try {
-    const peer = await makePeer();
-    Net.peer = peer; Net.host = false; Net.myId = peer.id;
-    let conn = null;
-    const t0 = now();
-    for (let attempt = 1; !conn && now() - t0 < 20000 && !joinAbort; attempt++) {
-      try { conn = await tryConnect(peer, PREFIX + code.toLowerCase()); }
-      catch (e) {
-        lastErr = e;
-        if (peer.disconnected) { try { peer.reconnect(); } catch (er) {} }
-        if (attempt >= 2) $('hmsg').innerHTML = `<span class="dots">Cerco la stanza ${code}</span><br><small>Chi l'ha creata deve avere il gioco aperto sullo schermo</small>`;
-        await new Promise(r => setTimeout(r, 2500));
-      }
-    }
-    if (!conn) throw lastErr || { type: 'timeout' };
-    Net.hostConn = conn;
-    conn.on('data', d => {
-      if (d && d.t === 's' && Array.isArray(d.peers)) {
-        Net.snap = d.peers.filter(e => e && typeof e.peer === 'string' && okPresence(e.presence)).slice(0, 12);
-        onNet();
-      }
+    await new Promise((res, rej) => {
+      let pending = BROKERS.length;
+      const to = setTimeout(() => rej({ type: anyConnected ? 'not-found' : 'no-server' }), 15000);
+      const hint = setTimeout(() => { if (!winner) $('hmsg').innerHTML = `<span class="dots">Cerco la stanza ${code}</span><br><small>Chi l'ha creata deve avere il gioco aperto sullo schermo</small>`; }, 5000);
+      BROKERS.forEach(url => {
+        connectBroker(url, { will }).then(c => {
+          clients.push(c); anyConnected = true;
+          if (winner || joinAbort) return;
+          c.subscribe(down, { qos: 0 });
+          setTimeout(() => { try { c.publish(base + '/up/' + myId, JSON.stringify({ hello: 1 }), { qos: 0 }); } catch (e) {} }, 150);
+          c.on('message', (topic, payload) => {
+            if (winner || topic !== down) return;
+            const d = parseMsg(payload);
+            if (d && Array.isArray(d.peers)) { winner = c; clearTimeout(to); clearTimeout(hint); res(); }
+          });
+        }).catch(() => { if (--pending === 0 && !anyConnected) { clearTimeout(to); clearTimeout(hint); rej({ type: 'no-server' }); } });
+      });
     });
-    conn.on('close', hostGone);
-    peer.on('disconnected', () => { if (Net.peer === peer) { try { peer.reconnect(); } catch (e) {} } });
+    clients.forEach(c => { if (c !== winner) { try { c.end(true); } catch (e) {} } });
+    const cli = winner;
+    Net.cli = cli; Net.host = false; Net.myId = myId; Net.base = base; Net.lastDown = Date.now();
+    cli.removeAllListeners('message');
+    cli.on('message', (topic, payload) => {
+      if (Net.cli !== cli || topic !== down) return;
+      const d = parseMsg(payload); if (!d) return;
+      if (d.closed) { hostGone(); return; }
+      if (!Array.isArray(d.peers)) return;
+      Net.lastDown = Date.now(); if (Net.warned) { Net.warned = false; toast('Il capo stanza è tornato 👍'); }
+      Net.snap = d.peers.filter(e => e && typeof e.peer === 'string' && okPresence(e.presence)).slice(0, 12);
+      onNet();
+    });
+    cli.on('connect', () => { if (Net.cli === cli) { cli.subscribe(down, { qos: 0 }); Net.schedSend(); } });
     roomState(code); H.on = false;
     Net.set({ n: me.n, e: me.e });
     setBusy(false); show('lobby'); render(); keepAwake();
   } catch (e) {
+    clients.forEach(c => { try { c.end(true); } catch (er) {} });
     await Net.leave(); setBusy(false);
     const why = (e && e.type) || 'sconosciuto';
-    homeErr((why === 'peer-unavailable' ? `Stanza ${code} non trovata. Chi l'ha creata deve avere il gioco aperto sullo schermo (con il pallino verde).` :
-      'Non riesco a collegarmi alla stanza. Riprova, oppure prova con un\'altra rete (es. Wi-Fi invece dei dati).') + ` [${APP_VERSION} · ${why}]`);
+    homeErr((why === 'not-found' ? `Stanza ${code} non trovata. Controlla il codice: chi l'ha creata deve avere il gioco aperto sullo schermo.` :
+      'Non riesco a collegarmi al server di gioco. Controlla la connessione e riprova.') + ` [${APP_VERSION} · ${why}]`);
   }
 };
 // link d'invito: sito#CODICE
@@ -866,7 +840,7 @@ $('copy').onclick = () => {
   const txt = `Giochiamo a Party Lampo! ⚡ Entra qui: ${link} (codice stanza: ${ST.code})`;
   if (navigator.share && matchMedia('(pointer: coarse)').matches) {
     navigator.share({ title: 'Party Lampo', text: `Giochiamo a Party Lampo! ⚡ Codice stanza: ${ST.code}`, url: link })
-      .then(() => { toast('Invito mandato! Resta su questa pagina 👍'); hostKeepAlive(true); }).catch(() => hostKeepAlive(true));
+      .then(() => toast('Invito mandato! Resta su questa pagina 👍')).catch(() => {});
     return;
   }
   try { navigator.clipboard.writeText(txt).then(done, () => toast('Codice: ' + ST.code)); } catch (e) { toast('Codice: ' + ST.code); }
